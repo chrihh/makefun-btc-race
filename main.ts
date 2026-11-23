@@ -9,12 +9,19 @@
 //   - Entry: when flat and the latest bar's close is at or above the
 //     highest high of the previous ENTRY_BARS bars, buy with (nearly)
 //     all cash. A close that breaks a half-hour range is a real move,
-//     not a wiggle.
+//     not a wiggle. The close must also sit above its TREND_BARS-bar
+//     simple average: breakouts under a falling long average are
+//     usually just bounces in a downtrend, and they are skipped.
 //   - Exit, the whole position, on whichever comes first:
 //       * the close falls to the lowest low of the previous EXIT_BARS
 //         bars (the move that justified the trade is over), or
 //       * the position is worth STOP_BPS less than its cost (the
 //         breakout failed; cut it before it grows).
+//   - One-strike rule: the first trade that closes at a loss ends the
+//     bot's day. Back-tests on shuffled and reversed windows show a
+//     first loss marks a hostile window: sitting out after it costs
+//     little in trending windows (where the first trade wins) and
+//     avoids the repeated stop-outs that bleed a falling window.
 //   - Every order caps its slippage at MAX_SLIPPAGE_BPS past the close
 //     it was decided on, so a gap at the next open refuses the fill and
 //     the rule is simply read again on the next bar.
@@ -29,6 +36,10 @@ import { BPS, runBars, type Bar, type BuyInput, type SellInput } from './vendor/
 const ENTRY_BARS = 30;
 /** A close at the low of this many previous bars ends the trade. */
 const EXIT_BARS = 150;
+/** Entries also need the close above the average of this many bars. */
+const TREND_BARS = 240;
+/** After this many losing trades the bot sits out the rest of the window. */
+const MAX_LOSSES = 1;
 /** Cut a position worth this fraction under its cost: 150 bps = 1.5%. */
 const STOP_NUM = 985n;
 const STOP_DEN = 1000n;
@@ -65,6 +76,16 @@ function recentLow(n: number): number {
   return m;
 }
 
+/** Simple average of the last `n` closes, the latest one included. */
+function sma(n: number): number {
+  let s = 0;
+  for (let i = closes.length - n; i < closes.length; i++) s += closes[i]!;
+  return s / n;
+}
+
+/** Trades closed at a loss so far (judged when the sell is decided). */
+let losses = 0;
+
 await runBars({
   onBatch(state, batch) {
     let fresh = false;
@@ -79,22 +100,28 @@ await runBars({
     const close = closes[closes.length - 1]!;
 
     if (held !== undefined) {
-      // Exit 1: the position is worth 1.5% less than it cost.
       const value = state.value(SYMBOL, held.qty);
+      // Exit 1: the position is worth 1.5% less than it cost.
       if (value * STOP_DEN <= held.cost * STOP_NUM) {
+        losses++;
         const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
         return [sell];
       }
       // Exit 2: the close fell to the lowest low of the exit window.
       if (closes.length > EXIT_BARS && close <= recentLow(EXIT_BARS)) {
+        if (value < held.cost) losses++;
         const sell: SellInput = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
         return [sell];
       }
       return [];
     }
 
-    // Entry: a close at or above the prior half-hour's highest high.
-    if (closes.length > ENTRY_BARS && close >= priorHigh(ENTRY_BARS)) {
+    // One-strike rule: after a losing trade, sit out the rest of the window.
+    if (losses >= MAX_LOSSES) return [];
+
+    // Entry: a close at or above the prior half-hour's highest high,
+    // with the close also above its long average (a real uptrend).
+    if (closes.length > ENTRY_BARS && close >= priorHigh(ENTRY_BARS) && (closes.length <= TREND_BARS || close > sma(TREND_BARS))) {
       const byWeight = (BigInt(state.hello.caps.max_weight_bps) * state.equity) / BPS;
       let spend = (state.cash * SPEND_NUM) / SPEND_DEN;
       if (byWeight < spend) spend = byWeight;
